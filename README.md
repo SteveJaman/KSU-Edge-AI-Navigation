@@ -155,6 +155,46 @@ test/
 
 ---
 
+## 🔐 Environment Variables (`.env` Setup)
+
+Some models (e.g., **Gemini Flash**) require API keys.  
+To enable cloud‑based evaluation, create a `.env` file in the project root:
+
+```
+# .env
+GEMINI_API_KEY=your_api_key_here
+```
+
+Then load it automatically by installing:
+
+```
+python-dotenv
+```
+
+Your engines will automatically read environment variables using:
+
+```python
+from dotenv import load_dotenv
+load_dotenv()
+```
+
+### ✔ Offline Models  
+All local VLMs (SmolVLM, FastVLM, MiniCPM, Qwen, LFM2, Moondream2) **do not require any API keys** and run fully offline.
+
+### ✔ Cloud Models  
+Only Gemini Flash requires:
+
+```
+GEMINI_API_KEY
+```
+
+If the key is missing, the benchmark will:
+
+- Skip cloud models  
+- Continue running all offline models normally
+
+---
+
 ## ▶️ Running the Benchmark
 
 ```
