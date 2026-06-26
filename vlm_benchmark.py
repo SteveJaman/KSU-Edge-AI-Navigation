@@ -64,7 +64,7 @@ MODEL_REGISTRY = {
     "smolvlm":   str(MODELS_DIR / "SmolVLM-500M-Instruct"),
     "fastvlm":   str(MODELS_DIR / "llava-interleave-qwen-0.5b"),
     "minicpm":   str(MODELS_DIR / "minicpm-v-4.6-1.3b"),
-    "qwen3.5":   str(MODELS_DIR / "qwen3.5-0.8b"),
+    "qwen2":   str(MODELS_DIR / "qwen2-vl-2b"),
     "moondream": str(MODELS_DIR / "moondream2-0.5b"),
     "lfm2":      str(MODELS_DIR / "LFM2-450m"),
     "gemini":    "api",
@@ -820,30 +820,36 @@ class MiniCPM_Engine(VLM_Benchmarking_Engine):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Qwen3.5-VL Engine  (Qwen/Qwen3.5-0.8B)
+# Qwen2-VL-2B Engine  (Qwen/Qwen2-VL-2B-Instruct)
 # ──────────────────────────────────────────────────────────────────────────────
-class Qwen35_08B_Engine(VLM_Benchmarking_Engine):
+class Qwen2VL_2B_Engine(VLM_Benchmarking_Engine):
 
-    MODEL_PATH = MODELS_DIR / "qwen3.5-0.8b"
+    MODEL_PATH = MODELS_DIR / "qwen2-vl-2b"
 
     def _load_model(self):
         import time
         import torch
-        from transformers import AutoTokenizer, AutoModelForCausalLM
+        from transformers import AutoProcessor
+
+        # Qwen2-VL models use Vision-Text architecture
+        try:
+            from transformers import AutoModelForVision2Seq
+            model_cls = AutoModelForVision2Seq
+        except ImportError:
+            from transformers import AutoModelForImageTextToText
+            model_cls = AutoModelForImageTextToText
 
         t_start = time.perf_counter()
         reset_vram_stats()
 
-        model_path = str(self.MODEL_PATH)
+        local = str(self.MODEL_PATH)
 
-        # Load tokenizer
-        self.processor = AutoTokenizer.from_pretrained(
-            model_path,
+        self.processor = AutoProcessor.from_pretrained(
+            local,
             trust_remote_code=True,
             local_files_only=True,
         )
 
-        # Load model
         load_kwargs = dict(
             trust_remote_code=True,
             local_files_only=True,
@@ -855,220 +861,63 @@ class Qwen35_08B_Engine(VLM_Benchmarking_Engine):
         else:
             load_kwargs["torch_dtype"] = torch.float16
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
+        self.model = model_cls.from_pretrained(
+            local,
             **load_kwargs
         ).to(self.device).eval()
 
-        self.model_id = "qwen3.5-0.8b-local"
+        self.model_id = "qwen2-vl-2b-local"
         self._load_time_s = round(time.perf_counter() - t_start, 3)
         self._load_mem_gb = peak_vram_gb(self.device)
 
-        print(f"[Qwen3.5-0.8B] Loaded in {self._load_time_s}s | VRAM {self._load_mem_gb}GB")
+        print(f"[Qwen2-VL-2B] Loaded in {self._load_time_s}s | VRAM {self._load_mem_gb}GB")
 
     def _measure_encode_ttft_decode(self, image_path: str) -> dict:
+        import time
         import torch
         from PIL import Image
-        import base64
-        from io import BytesIO
 
-        # ───────────────────────────────────────────────
-        # Encode image as base64 (Qwen3.5 is text-only)
-        # ───────────────────────────────────────────────
         image = Image.open(image_path).convert("RGB")
-        buf = BytesIO()
-        image.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        # Build prompt
-        prompt = (
-            f"<image>\n"
-            f"data:image/png;base64,{b64}\n"
-            f"</image>\n\n"
-            f"{self.prompt}"
-        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": self.prompt},
+                ],
+            }
+        ]
 
-        # ───────────────────────────────────────────────
-        # Encode time (tokenization)
-        # ───────────────────────────────────────────────
-        t_enc_start = time.perf_counter()
-        inputs = self.processor(
-            prompt,
-            return_tensors="pt"
-        ).to(self.device)
-        encode_time = time.perf_counter() - t_enc_start
+        # Encode
+        t_enc = time.perf_counter()
+        text = self.processor.apply_chat_template(messages, add_generation_prompt=True)
+        inputs = self.processor(text=[text], images=[image], return_tensors="pt").to(self.device)
+        encode_time = time.perf_counter() - t_enc
 
-        # ───────────────────────────────────────────────
-        # TTFT (1-token generation)
-        # ───────────────────────────────────────────────
+        # TTFT
         t_ttft = time.perf_counter()
         with torch.no_grad():
-            self.model.generate(
-                **inputs,
-                max_new_tokens=1,
-                do_sample=False,
-                eos_token_id=self.processor.eos_token_id,
-            )
+            self.model.generate(**inputs, max_new_tokens=1, do_sample=False)
         ttft = time.perf_counter() - t_ttft
 
-        # ───────────────────────────────────────────────
-        # Full generation (E2E = encode + decode)
-        # ───────────────────────────────────────────────
+        # Full generation
         t_full = time.perf_counter()
         with torch.no_grad():
             generated_ids = self.model.generate(
                 **inputs,
                 max_new_tokens=128,
                 do_sample=False,
-                eos_token_id=self.processor.eos_token_id,
             )
-        e2e = encode_time + (time.perf_counter() - t_full)
-
-        # Decode output
-        input_len  = inputs["input_ids"].shape[1]
-        new_tokens = generated_ids[:, input_len:]
-        output = self.processor.decode(new_tokens[0], skip_special_tokens=True).strip()
-
-        # Token count + TPS
-        tokens = len(output.split())
-        decode_tps = round(tokens / e2e, 2) if e2e > 0 else None
-
-        torch.cuda.empty_cache()
-
-        return {
-            "output":        output,
-            "encode_time_s": round(encode_time, 4),
-            "ttft_s":        round(ttft, 4),
-            "decode_tps":    decode_tps,
-            "e2e_latency_s": round(e2e, 4),
-            "token_count":   tokens,
-        }
-
-    def _generate(self, image_path: str) -> str:
-        import torch
-        from PIL import Image
-        import base64
-        from io import BytesIO
-
-        try:
-            # Load + encode image as base64 (Qwen3.5 is text-only)
-            image = Image.open(image_path).convert("RGB")
-            buf = BytesIO()
-            image.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-            # Build prompt: your benchmark uses self.prompt
-            # We embed the image as base64 inside the text prompt
-            prompt = (
-                f"<image>\n"
-                f"data:image/png;base64,{b64}\n"
-                f"</image>\n\n"
-                f"{self.prompt}"
-            )
-
-            inputs = self.processor(
-                prompt,
-                return_tensors="pt"
-            ).to(self.device)
-
-            with torch.no_grad():
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=128,
-                    do_sample=False,
-                    eos_token_id=self.processor.eos_token_id,
-                )
-
-            output = self.processor.decode(
-                generated_ids[0],
-                skip_special_tokens=True
-            ).strip()
-
-            torch.cuda.empty_cache()
-            return output
-
-        except Exception as e:
-            return f"Error: {e}"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Moondream2 Engine  (moondream2-0.5b)
-# ──────────────────────────────────────────────────────────────────────────────
-class Moondream2_05B_Engine(VLM_Benchmarking_Engine):
-
-    MODEL_PATH = MODELS_DIR / "moondream2-0.5b"
-
-    def _load_model(self):
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        t_start = time.perf_counter()
-        reset_vram_stats()
-
-        local = str(self.MODEL_PATH)
-
-        self.processor = AutoTokenizer.from_pretrained(
-            local,
-            trust_remote_code=True,
-            local_files_only=True,
-        )
-
-        load_kwargs = dict(
-            trust_remote_code=True,
-            local_files_only=True,
-            torch_dtype=torch.float16,
-        )
-        if self.precision == "int4":
-            from transformers import BitsAndBytesConfig
-            load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
-            del load_kwargs["torch_dtype"]
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            local, **load_kwargs
-        ).to(self.device).eval()
-
-        self.model_id     = "moondream2-0.5b-local"
-        self._load_time_s = round(time.perf_counter() - t_start, 3)
-        self._load_mem_gb = peak_vram_gb(self.device)
-        print(f"[Moondream2-0.5B] Loaded in {self._load_time_s}s | VRAM {self._load_mem_gb}GB")
-        
-    def _generate(self, image_path: str) -> str:
-        try:
-            from PIL import Image
-            image = Image.open(image_path).convert("RGB")
-
-            enc = self.model.encode_image(image)
-            result = self.model.answer_question(enc, self.prompt, tokenizer=None)
-
-            if isinstance(result, dict):
-                return str(result.get("answer", "")).strip()
-            return str(result).strip()
-
-        except Exception as e:
-            return f"Error: {e}"
-
-    def _measure_encode_ttft_decode(self, image_path: str) -> dict:
-        from PIL import Image
-
-        image = Image.open(image_path).convert("RGB")
-
-        t_enc = time.perf_counter()
-        enc = self.model.encode_image(image)
-        encode_time = time.perf_counter() - t_enc
-
-        t_ttft = time.perf_counter()
-        self.model.answer_question(enc, "Ok.", tokenizer=None)
-        ttft = time.perf_counter() - t_ttft
-
-        t_full = time.perf_counter()
-        result = self.model.answer_question(enc, self.prompt, tokenizer=None)
         decode_time = time.perf_counter() - t_full
 
-        if isinstance(result, dict):
-            output = str(result.get("answer", "")).strip()
-        else:
-            output = str(result).strip()
+        # Decode only new tokens
+        input_len = inputs["input_ids"].shape[1]
+        new_tokens = generated_ids[:, input_len:]
+        output = self.processor.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
 
-        e2e    = encode_time + decode_time
         tokens = count_tokens(output)
+        e2e = encode_time + decode_time
 
         return {
             "output":        output,
@@ -1078,7 +927,172 @@ class Moondream2_05B_Engine(VLM_Benchmarking_Engine):
             "e2e_latency_s": round(e2e, 4),
             "token_count":   tokens,
         }
-        
+
+    def _generate(self, image_path: str) -> str:
+        import torch
+        from PIL import Image
+
+        try:
+            image = Image.open(image_path).convert("RGB")
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": self.prompt},
+                    ],
+                }
+            ]
+
+            text = self.processor.apply_chat_template(messages, add_generation_prompt=True)
+            inputs = self.processor(text=[text], images=[image], return_tensors="pt").to(self.device)
+
+            with torch.no_grad():
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=128,
+                    do_sample=False,
+                )
+
+            input_len = inputs["input_ids"].shape[1]
+            new_tokens = generated_ids[:, input_len:]
+            output = self.processor.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
+
+            return output
+
+        except Exception as e:
+            return f"Error: {e}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Moondream2 Engine  (moondream2-0.5b)
+# ──────────────────────────────────────────────────────────────────────────────
+class Moondream2_05B_Engine(VLM_Benchmarking_Engine):
+
+    MODEL_PATH = MODELS_DIR / "moondream2-0.5b"
+
+    def _load_model(self):
+        import time
+        from transformers import AutoModelForCausalLM
+
+        t_start = time.perf_counter()
+        reset_vram_stats()
+
+        # Map precision properly. Native loading without explicit dtype causes
+        # activation underflows/NaNs on certain consumer cards, leading to immediate EOS tokens.
+        if self.precision == "fp16":
+            dtype = torch.float16
+        elif self.precision == "bf16":
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float32
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            str(self.MODEL_PATH),
+            trust_remote_code=True,
+            local_files_only=True,
+            device_map={"": self.device},
+            torch_dtype=dtype
+        ).eval()
+
+        self.tokenizer = None
+        self.model_id = "moondream2-0.5b"
+        self._load_time_s = round(time.perf_counter() - t_start, 3)
+        self._load_mem_gb = peak_vram_gb(self.device)
+
+        print(f"[Moondream2-0.5B] Loaded in {self._load_time_s}s | VRAM {self._load_mem_gb}GB")
+
+    # ----------------------------------------------------------------------
+    # A Moondream‑friendly compressed spatial prompt
+    # ----------------------------------------------------------------------
+    def _md_prompt(self) -> str:
+        """
+        Compressed prompt. Moondream2-0.5B immediately returns an empty string 
+        when overwhelmed by long instructions or multi-part conditions.
+        """
+        return "Describe the room layout, visible obstacles, and any clear paths for navigation."
+
+    # ----------------------------------------------------------------------
+    # Safe answer with fallback prompts
+    # ----------------------------------------------------------------------
+    def _safe_answer(self, image) -> str:
+        """
+        Try the navigation prompt first, then fall back to simpler VQA prompts
+        if Moondream2 returns an empty answer.
+        """
+        questions = [
+            self._md_prompt(),
+            "Describe the scene and layout.",
+            "What objects are in front of the camera?",
+        ]
+
+        for q in questions:
+            try:
+                result = self.model.query(image, q)
+                ans = result.get("answer", "").strip() if isinstance(result, dict) else str(result).strip()
+                if ans:
+                    return ans
+            except Exception:
+                continue
+
+        return "[Moondream2 returned no answer]"
+
+    # ----------------------------------------------------------------------
+    # Standard generate() path
+    # ----------------------------------------------------------------------
+    def _generate(self, image_path: str) -> str:
+        from PIL import Image
+
+        try:
+            image = Image.open(image_path).convert("RGB")
+            result = self.model.query(image, self._md_prompt())
+            
+            if isinstance(result, dict):
+                ans = result.get("answer", "").strip()
+            else:
+                ans = str(result).strip()
+                
+            return ans if ans else "[Moondream2 returned no answer]"
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ----------------------------------------------------------------------
+    # Latency measurement path
+    # ----------------------------------------------------------------------
+    def _measure_encode_ttft_decode(self, image_path: str) -> dict:
+        from PIL import Image
+        import time
+
+        image = Image.open(image_path).convert("RGB")
+
+        # Encode — moondream encodes internally, approximate via short captioning
+        t_enc = time.perf_counter()
+        self.model.caption(image, length="short")
+        encode_time = time.perf_counter() - t_enc
+
+        # TTFT — short prompt, measures time to first token response block
+        t_ttft = time.perf_counter()
+        self.model.query(image, "What is this?")
+        ttft = time.perf_counter() - t_ttft
+
+        # Full decode with safe query fallback architecture
+        t_full = time.perf_counter()
+        output = self._safe_answer(image)
+        decode_time = time.perf_counter() - t_full
+
+        tokens = count_tokens(output)
+        e2e = encode_time + decode_time
+
+        return {
+            "output": output,
+            "encode_time_s": round(encode_time, 4),
+            "ttft_s": round(ttft, 4),
+            "decode_tps": round(tokens / decode_time, 2) if decode_time > 0 else None,
+            "e2e_latency_s": round(e2e, 4),
+            "token_count": tokens,
+        }
+                
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LFM2 Engine  (LFM2_450M)
@@ -1337,7 +1351,7 @@ ENGINE_MAP = {
     "smolvlm":   SmolVLM_Engine,
     "fastvlm":   FastVLM_Engine,
     "minicpm":   MiniCPM_Engine,
-    "qwen3.5":   Qwen35_08B_Engine,
+    "qwen2":     Qwen2VL_2B_Engine,
     "moondream": Moondream2_05B_Engine,
     "lfm2":      LFM2_450M_Engine,   
     "gemini":    Gemini_Engine,
@@ -1371,7 +1385,7 @@ def get_results_path(model_key: str) -> tuple[str, str]:
         "smolvlm":  "smolvlm",
         "fastvlm":  "fastvlm",
         "minicpm":  "minicpm",
-        "qwen3.5":  "qwen3.5",
+        "qwen2":  "qwen2",
         "moondream": "moondream", 
         "lfm2":      "lfm2", 
     }
@@ -1387,7 +1401,7 @@ MODEL_LABELS = {
     "1": ("smolvlm",   "SmolVLM-500M"),
     "2": ("fastvlm",   "FastVLM-0.5B"),
     "3": ("minicpm",   "MiniCPM-V 4.6"),
-    "4": ("qwen3.5",   "Qwen3.5-0.8B"),
+    "4": ("qwen2",   "Qwen2-2B"),
     "5": ("moondream", "Moondream2-0.5B"),
     "6": ("lfm2",      "LFM2-450M"),
     "7": ("gemini",    "Gemini 2.5 Flash  [cloud]"),

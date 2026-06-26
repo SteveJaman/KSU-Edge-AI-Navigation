@@ -12,7 +12,7 @@ MODEL_SOURCES = {
     "fastvlm-0.5b":         "apple/FastVLM-0.5B",
     "LFM2-450m":            "LiquidAI/LFM2-VL-450M",
     "minicpm-v-4.6-1.3b":   "openbmb/MiniCPM-V-4_6",
-    "moondream2-0.5b":      "vikhyatk/moondream2",
+    "moondream2-0.5b":      "whistleroosh/moondream-0.5B",
     "qwen3.5-0.8b":         "Qwen/Qwen2.5-0.5B-Instruct",
     "smolvlm-500m":         "HuggingFaceTB/SmolVLM-500M-Instruct",
 }
