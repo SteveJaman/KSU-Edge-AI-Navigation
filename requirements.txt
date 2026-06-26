@@ -1,0 +1,8 @@
+torch>=2.4.0
+transformers>=4.45.0
+accelerate
+bitsandbytes
+pandas
+pillow
+tqdm
+python-dotenv
