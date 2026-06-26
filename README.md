@@ -287,13 +287,6 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 ### **CUDA out of memory**  
 Use INT4 or reduce image resolution.
 
-### **Dataset missing**  
-Run:
-
-```
-python setup_dataset.py
-```
-
 ---
 
 ## 📄 Citation
