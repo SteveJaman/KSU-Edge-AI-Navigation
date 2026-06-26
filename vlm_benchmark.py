@@ -998,187 +998,87 @@ class Moondream2_05B_Engine(VLM_Benchmarking_Engine):
     MODEL_PATH = MODELS_DIR / "moondream2-0.5b"
 
     def _load_model(self):
-        import time
-        import torch
-        from transformers import AutoProcessor, AutoModelForImageTextToText
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         t_start = time.perf_counter()
         reset_vram_stats()
 
-        model_path = str(self.MODEL_PATH)
+        local = str(self.MODEL_PATH)
 
-        # Load processor
-        self.processor = AutoProcessor.from_pretrained(
-            model_path,
+        self.processor = AutoTokenizer.from_pretrained(
+            local,
             trust_remote_code=True,
             local_files_only=True,
         )
 
-        # Load model
         load_kwargs = dict(
             trust_remote_code=True,
             local_files_only=True,
+            torch_dtype=torch.float16,
         )
-
         if self.precision == "int4":
             from transformers import BitsAndBytesConfig
             load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
-        else:
-            load_kwargs["torch_dtype"] = torch.bfloat16
+            del load_kwargs["torch_dtype"]
 
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            model_path,
-            **load_kwargs
+        self.model = AutoModelForCausalLM.from_pretrained(
+            local, **load_kwargs
         ).to(self.device).eval()
 
-        self.model_id = "moondream2-0.5b-local"
+        self.model_id     = "moondream2-0.5b-local"
         self._load_time_s = round(time.perf_counter() - t_start, 3)
         self._load_mem_gb = peak_vram_gb(self.device)
-
         print(f"[Moondream2-0.5B] Loaded in {self._load_time_s}s | VRAM {self._load_mem_gb}GB")
+        
+    def _generate(self, image_path: str) -> str:
+        try:
+            from PIL import Image
+            image = Image.open(image_path).convert("RGB")
 
-    # ----------------------------------------------------------------------
-    # Full benchmark metrics (encode, TTFT, decode TPS, E2E)
-    # ----------------------------------------------------------------------
+            enc = self.model.encode_image(image)
+            result = self.model.answer_question(enc, self.prompt, tokenizer=None)
+
+            if isinstance(result, dict):
+                return str(result.get("answer", "")).strip()
+            return str(result).strip()
+
+        except Exception as e:
+            return f"Error: {e}"
+
     def _measure_encode_ttft_decode(self, image_path: str) -> dict:
-        import torch
-        import time
         from PIL import Image
 
-        # Load + resize image (Moondream2 uses 1024px max)
         image = Image.open(image_path).convert("RGB")
-        w, h = image.size
-        max_side = max(w, h)
-        if max_side > 1024:
-            scale = 1024 / max_side
-            image = image.resize(
-                (int(w * scale), int(h * scale)),
-                Image.Resampling.LANCZOS
-            )
 
-        # Build chat prompt
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": self.prompt},
-                ],
-            }
-        ]
-        prompt = self.processor.apply_chat_template(
-            conversation,
-            add_generation_prompt=True
-        )
+        t_enc = time.perf_counter()
+        enc = self.model.encode_image(image)
+        encode_time = time.perf_counter() - t_enc
 
-        # -------------------------
-        # Encode time
-        # -------------------------
-        t_enc_start = time.perf_counter()
-        inputs = self.processor(
-            images=image,
-            text=prompt,
-            return_tensors="pt"
-        ).to(self.device)
-        encode_time = time.perf_counter() - t_enc_start
-
-        # -------------------------
-        # TTFT
-        # -------------------------
         t_ttft = time.perf_counter()
-        with torch.no_grad():
-            self.model.generate(
-                **inputs,
-                max_new_tokens=1,
-                do_sample=False
-            )
+        self.model.answer_question(enc, "Ok.", tokenizer=None)
         ttft = time.perf_counter() - t_ttft
 
-        # -------------------------
-        # Full generation (E2E)
-        # -------------------------
         t_full = time.perf_counter()
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=128,
-                do_sample=False
-            )
-        e2e = encode_time + (time.perf_counter() - t_full)
+        result = self.model.answer_question(enc, self.prompt, tokenizer=None)
+        decode_time = time.perf_counter() - t_full
 
-        # Trim input tokens
-        input_len = inputs["input_ids"].shape[1]
-        new_tokens = generated_ids[:, input_len:]
-        output = self.processor.batch_decode(
-            new_tokens,
-            skip_special_tokens=True
-        )[0].strip()
+        if isinstance(result, dict):
+            output = str(result.get("answer", "")).strip()
+        else:
+            output = str(result).strip()
 
-        # Token count + TPS
-        tokens = len(output.split())
-        decode_tps = round(tokens / e2e, 2) if e2e > 0 else None
-
-        torch.cuda.empty_cache()
+        e2e    = encode_time + decode_time
+        tokens = count_tokens(output)
 
         return {
             "output":        output,
             "encode_time_s": round(encode_time, 4),
             "ttft_s":        round(ttft, 4),
-            "decode_tps":    decode_tps,
+            "decode_tps":    round(tokens / e2e, 2) if e2e > 0 else None,
             "e2e_latency_s": round(e2e, 4),
             "token_count":   tokens,
         }
-
-    # ----------------------------------------------------------------------
-    # Simple generate() fallback
-    # ----------------------------------------------------------------------
-    def _generate(self, image_path: str) -> str:
-        import torch
-        from PIL import Image
-
-        try:
-            image = Image.open(image_path).convert("RGB")
-
-            conversation = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": self.prompt},
-                    ],
-                }
-            ]
-
-            prompt = self.processor.apply_chat_template(
-                conversation,
-                add_generation_prompt=True
-            )
-
-            inputs = self.processor(
-                images=image,
-                text=prompt,
-                return_tensors="pt"
-            ).to(self.device)
-
-            with torch.no_grad():
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=128,
-                    do_sample=False
-                )
-
-            input_len = inputs["input_ids"].shape[1]
-            new_tokens = generated_ids[:, input_len:]
-            output = self.processor.batch_decode(
-                new_tokens,
-                skip_special_tokens=True
-            )[0].strip()
-
-            torch.cuda.empty_cache()
-            return output
-
-        except Exception as e:
-            return f"Error: {e}"
+        
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LFM2 Engine  (LFM2_450M)
@@ -1439,6 +1339,7 @@ ENGINE_MAP = {
     "minicpm":   MiniCPM_Engine,
     "qwen3.5":   Qwen35_08B_Engine,
     "moondream": Moondream2_05B_Engine,
+    "lfm2":      LFM2_450M_Engine,   
     "gemini":    Gemini_Engine,
 }
 
