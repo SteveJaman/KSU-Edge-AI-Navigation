@@ -123,22 +123,24 @@ models/<model-key>/
 
 ---
 
-## 📥 Download the Dataset
+## 🛠 Data Setup
 
-Run:
+To run the benchmarking scripts, you will need the project's test dataset (containing the evaluation images and videos).
 
-```
-python setup_dataset.py
-```
+1. **Download the dataset:** [Download Test Dataset from Google Drive](https://drive.google.com/drive/folders/1_4paEVv-lHZO6c0Bk9POEvoVDqvEq_Mg?usp=sharing)
+2. **Setup:** Download the folder and extract the contents into the `test/` directory at the root of this project:
 
-This script:
+```bash
+# Your directory structure should look like this:
+KSU-Edge-AI-Navigation/
+├── test/
+│   ├── images/
+│   └── videos/
+├── vlm_benchmark.py
+└── README.md
 
-- Creates `datasets/indoor-nav/`
-- Downloads the indoor navigation dataset
-- Extracts it
-- Verifies integrity
-
----
+    Models:
+    Note: Model weights are not included in this repository due to size constraints. Please ensure your models/ directory is populated with the necessary files before running the benchmark.
 
 ## ▶️ Running the Benchmark
 
