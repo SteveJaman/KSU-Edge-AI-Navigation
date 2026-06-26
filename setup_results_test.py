@@ -3,16 +3,16 @@ from pathlib import Path
 # Set the base directory to your project root
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-# Define the folders to create
+# Define the folders to create (must match model_key names in benchmark)
 RESULTS_SUBFOLDERS = [
     "Combined_CSV",
-    "fastvlm",
+    "fastvlm-0.5b",
     "gemini_flash",
-    "LFM2",
-    "minicpm",
-    "moondream",
-    "qwen3.5",
-    "smolvlm"
+    "lfm2-450m",
+    "minicpm-v-4.6-1.3b",
+    "moondream2-0.5b",
+    "qwen3.5-0.8b",
+    "smolvlm-500m",
 ]
 
 def setup_folders():
