@@ -64,7 +64,8 @@ MODEL_REGISTRY = {
     "smolvlm":   str(MODELS_DIR / "SmolVLM-500M-Instruct"),
     "fastvlm":   str(MODELS_DIR / "llava-interleave-qwen-0.5b"),
     "minicpm":   str(MODELS_DIR / "minicpm-v-4.6-1.3b"),
-    "qwen2":   str(MODELS_DIR / "qwen2-vl-2b"),
+    "qwen2":     str(MODELS_DIR / "qwen2-vl-2b"),
+    "qwen3.5": str(MODELS_DIR / "qwen3.5-0.8b"),
     "moondream": str(MODELS_DIR / "moondream2-0.5b"),
     "lfm2":      str(MODELS_DIR / "LFM2-450m"),
     "gemini":    "api",
@@ -964,6 +965,143 @@ class Qwen2VL_2B_Engine(VLM_Benchmarking_Engine):
         except Exception as e:
             return f"Error: {e}"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Qwen3.5-0.8B Engine  (natively multimodal)
+# ──────────────────────────────────────────────────────────────────────────────
+class Qwen35_Engine(VLM_Benchmarking_Engine):
+
+    MODEL_PATH = MODELS_DIR / "qwen3.5-0.8b"
+
+    def _load_model(self):
+        import time
+        from transformers import AutoProcessor, AutoModelForImageTextToText
+
+        t_start = time.perf_counter()
+        reset_vram_stats()
+
+        local = str(self.MODEL_PATH)
+
+        self.processor = AutoProcessor.from_pretrained(
+            local,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+
+        load_kwargs = dict(
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        if self.precision == "int4":
+            from transformers import BitsAndBytesConfig
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+        else:
+            load_kwargs["torch_dtype"] = torch.bfloat16  # native dtype — NOT fp16
+
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            local,
+            **load_kwargs
+        ).to(self.device).eval()
+
+        self.model_id = "qwen3.5-0.8b-local"
+        self._load_time_s = round(time.perf_counter() - t_start, 3)
+        self._load_mem_gb = peak_vram_gb(self.device)
+        print(f"[Qwen3.5-0.8B] Loaded in {self._load_time_s}s | VRAM {self._load_mem_gb}GB")
+
+    def _build_inputs(self, image):
+        """Build processor inputs from a PIL image using the proper chat template."""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": self.prompt},
+                ],
+            }
+        ]
+        text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        return self.processor(
+            text=text,
+            images=[image],
+            return_tensors="pt",
+        ).to(self.device)
+
+    def _decode_output(self, generated_ids, input_len: int) -> str:
+        import re
+        new_tokens = generated_ids[:, input_len:]
+        text = self.processor.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
+        # Strip <think>...</think> blocks if thinking mode fires
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        return text or "[empty response]"
+
+    def _generate(self, image_path: str) -> str:
+        try:
+            image = Image.open(image_path).convert("RGB")
+            inputs = self._build_inputs(image)
+
+            with torch.no_grad():
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=128,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.80,
+                    top_k=20,
+                    repetition_penalty=1.0,
+                )
+
+            output = self._decode_output(generated_ids, inputs["input_ids"].shape[1])
+            torch.cuda.empty_cache()
+            return output
+
+        except Exception as e:
+            return f"Error: {e}"
+
+    def _measure_encode_ttft_decode(self, image_path: str) -> dict:
+        image = Image.open(image_path).convert("RGB")
+
+        # Encode
+        t_enc = time.perf_counter()
+        inputs = self._build_inputs(image)
+        encode_time = time.perf_counter() - t_enc
+
+        # TTFT
+        t_ttft = time.perf_counter()
+        with torch.no_grad():
+            self.model.generate(**inputs, max_new_tokens=1, do_sample=False)
+        ttft = time.perf_counter() - t_ttft
+
+        # Full generation
+        t_full = time.perf_counter()
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=128,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.80,
+                top_k=20,
+                repetition_penalty=1.0,
+            )
+        decode_time = time.perf_counter() - t_full
+
+        output = self._decode_output(generated_ids, inputs["input_ids"].shape[1])
+        tokens = count_tokens(output)
+        e2e = encode_time + decode_time
+
+        torch.cuda.empty_cache()
+        return {
+            "output":        output,
+            "encode_time_s": round(encode_time, 4),
+            "ttft_s":        round(ttft, 4),
+            "decode_tps":    round(tokens / decode_time, 2) if decode_time > 0 else None,
+            "e2e_latency_s": round(e2e, 4),
+            "token_count":   tokens,
+        }
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Moondream2 Engine  (moondream2-0.5b)
@@ -1093,7 +1231,6 @@ class Moondream2_05B_Engine(VLM_Benchmarking_Engine):
             "token_count": tokens,
         }
                 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # LFM2 Engine  (LFM2_450M)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1352,6 +1489,7 @@ ENGINE_MAP = {
     "fastvlm":   FastVLM_Engine,
     "minicpm":   MiniCPM_Engine,
     "qwen2":     Qwen2VL_2B_Engine,
+    "qwen3.5":   Qwen35_Engine,
     "moondream": Moondream2_05B_Engine,
     "lfm2":      LFM2_450M_Engine,   
     "gemini":    Gemini_Engine,
@@ -1386,6 +1524,7 @@ def get_results_path(model_key: str) -> tuple[str, str]:
         "fastvlm":  "fastvlm",
         "minicpm":  "minicpm",
         "qwen2":  "qwen2",
+        "qwen3.5":  "qwen3.5",
         "moondream": "moondream", 
         "lfm2":      "lfm2", 
     }
@@ -1401,10 +1540,11 @@ MODEL_LABELS = {
     "1": ("smolvlm",   "SmolVLM-500M"),
     "2": ("fastvlm",   "FastVLM-0.5B"),
     "3": ("minicpm",   "MiniCPM-V 4.6"),
-    "4": ("qwen2",   "Qwen2-2B"),
-    "5": ("moondream", "Moondream2-0.5B"),
-    "6": ("lfm2",      "LFM2-450M"),
-    "7": ("gemini",    "Gemini 2.5 Flash  [cloud]"),
+    "4": ("qwen2",   "Qwen2-2B"), 
+    "5": ("qwen3.5",    "Qwem3.5-0.8b"),
+    "6": ("moondream", "Moondream2-0.5B"),
+    "7": ("lfm2",      "LFM2-450M"),
+    "8": ("gemini",    "Gemini 2.5 Flash  [cloud]"),
 }
 
 
